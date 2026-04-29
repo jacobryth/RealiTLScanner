@@ -2,65 +2,115 @@ package main
 
 import (
 	"crypto/tls"
-	"log/slog"
+	"fmt"
 	"net"
-	"strconv"
-	"strings"
 	"time"
 )
 
-func ScanTLS(host Host, out chan<- string, geo *Geo) {
-	if host.IP == nil {
-		ip, err := LookupIP(host.Origin)
-		if err != nil {
-			slog.Debug("Failed to get IP from the origin", "origin", host.Origin, "err", err)
-			return
-		}
-		host.IP = ip
+// ScanResult holds the result of a TLS scan for a single host.
+type ScanResult struct {
+	IP          string
+	Port        string
+	ServerName  string
+	Version     uint16
+	CipherSuite uint16
+	Cert        *CertInfo
+	SupportsH2  bool
+	Error       error
+}
+
+// CertInfo holds relevant certificate details.
+type CertInfo struct {
+	Subject    string
+	Issuer     string
+	NotBefore  time.Time
+	NotAfter   time.Time
+	SANs       []string
+	IsCA       bool
+}
+
+// Scanner performs TLS scanning operations.
+type Scanner struct {
+	Timeout    time.Duration
+	ServerName string
+	Port       string
+}
+
+// NewScanner creates a new Scanner with sensible defaults.
+func NewScanner(serverName, port string, timeout time.Duration) *Scanner {
+	if timeout == 0 {
+		timeout = 5 * time.Second
 	}
-	hostPort := net.JoinHostPort(host.IP.String(), strconv.Itoa(port))
-	conn, err := net.DialTimeout("tcp", hostPort, time.Duration(timeout)*time.Second)
+	if port == "" {
+		port = "443"
+	}
+	return &Scanner{
+		Timeout:    timeout,
+		ServerName: serverName,
+		Port:       port,
+	}
+}
+
+// Scan performs a TLS handshake against the given IP and returns a ScanResult.
+func (s *Scanner) Scan(ip string) *ScanResult {
+	result := &ScanResult{
+		IP:         ip,
+		Port:       s.Port,
+		ServerName: s.ServerName,
+	}
+
+	addr := net.JoinHostPort(ip, s.Port)
+
+	dialer := &net.Dialer{
+		Timeout: s.Timeout,
+	}
+
+	tlsCfg := &tls.Config{
+		ServerName:         s.ServerName,
+		InsecureSkipVerify: false, //nolint:gosec // intentional for scanning
+		MinVersion:         tls.VersionTLS12,
+		NextProtos:         []string{"h2", "http/1.1"},
+	}
+
+	conn, err := tls.DialWithDialer(dialer, "tcp", addr, tlsCfg)
 	if err != nil {
-		slog.Debug("Cannot dial", "target", hostPort)
-		return
+		result.Error = fmt.Errorf("dial %s: %w", addr, err)
+		return result
 	}
 	defer conn.Close()
-	err = conn.SetDeadline(time.Now().Add(time.Duration(timeout) * time.Second))
-	if err != nil {
-		slog.Error("Error setting deadline", "err", err)
-		return
+
+	state := conn.ConnectionState()
+	result.Version = state.Version
+	result.CipherSuite = state.CipherSuite
+	result.SupportsH2 = state.NegotiatedProtocol == "h2"
+
+	if len(state.PeerCertificates) > 0 {
+		cert := state.PeerCertificates[0]
+		result.Cert = &CertInfo{
+			Subject:   cert.Subject.String(),
+			Issuer:    cert.Issuer.String(),
+			NotBefore: cert.NotBefore,
+			NotAfter:  cert.NotAfter,
+			SANs:      cert.DNSNames,
+			IsCA:      cert.IsCA,
+		}
 	}
-	tlsCfg := &tls.Config{
-		InsecureSkipVerify: true,
-		NextProtos:         []string{"h2", "http/1.1"},
-		CurvePreferences:   []tls.CurveID{tls.X25519},
+
+	return result
+}
+
+// TLSVersionName returns a human-readable TLS version string.
+func TLSVersionName(version uint16) string {
+	switch version {
+	case tls.VersionTLS10:
+		return "TLS 1.0"
+	case tls.VersionTLS11:
+		return "TLS 1.1"
+	case tls.VersionTLS12:
+		return "TLS 1.2"
+	case tls.VersionTLS13:
+		return "TLS 1.3"
+	default:
+		return fmt.Sprintf("Unknown(0x%04x)", version)
 	}
-	if host.Type == HostTypeDomain {
-		tlsCfg.ServerName = host.Origin
-	}
-	c := tls.Client(conn, tlsCfg)
-	err = c.Handshake()
-	if err != nil {
-		slog.Debug("TLS handshake failed", "target", hostPort)
-		return
-	}
-	state := c.ConnectionState()
-	alpn := state.NegotiatedProtocol
-	domain := state.PeerCertificates[0].Subject.CommonName
-	issuers := strings.Join(state.PeerCertificates[0].Issuer.Organization, " | ")
-	log := slog.Info
-	feasible := true
-	geoCode := geo.GetGeo(host.IP)
-	if state.Version != tls.VersionTLS13 || alpn != "h2" || len(domain) == 0 || len(issuers) == 0 {
-		// not feasible
-		log = slog.Debug
-		feasible = false
-	} else {
-		out <- strings.Join([]string{host.IP.String(), host.Origin, domain, "\"" + issuers + "\"", geoCode}, ",") +
-			"\n"
-	}
-	log("Connected to target", "feasible", feasible, "ip", host.IP.String(),
-		"origin", host.Origin,
-		"tls", tls.VersionName(state.Version), "alpn", alpn, "cert-domain", domain, "cert-issuer", issuers,
-		"geo", geoCode)
 }
