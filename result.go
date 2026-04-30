@@ -42,7 +42,8 @@ func NewResultWriter(filePath string) (*ResultWriter, error) {
 	if filePath == "" {
 		rw.file = os.Stdout
 	} else {
-		f, err := os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		// Use 0600 instead of 0644 so result files are only readable by the owner.
+		f, err := os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
 		if err != nil {
 			return nil, fmt.Errorf("failed to open output file %s: %w", filePath, err)
 		}
