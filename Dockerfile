@@ -5,7 +5,8 @@ COPY . .
 RUN go build -trimpath -ldflags "-s -w" -o RealiTLScanner .
 
 FROM alpine:latest
-RUN apk add --no-cache ca-certificates
+# ca-certificates needed for TLS scanning, tzdata for consistent logging timestamps
+RUN apk add --no-cache ca-certificates tzdata
 WORKDIR /app
 COPY --from=build /src/RealiTLScanner .
 ENTRYPOINT ["./RealiTLScanner"]
